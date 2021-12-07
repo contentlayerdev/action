@@ -8,6 +8,7 @@ import {
   getChangelogEntry,
   execWithOutput,
   getChangedPackages,
+  getOrderedPackages,
   sortTheThings,
   getVersionsByDirectory,
 } from "./utils";
@@ -15,7 +16,66 @@ import * as gitUtils from "./gitUtils";
 import readChangesetState from "./readChangesetState";
 import resolveFrom from "resolve-from";
 
-const createRelease = async (
+const contentLayerPackageGroup = ["@contentlayer/core", "@contentlayer/*"];
+
+const createAggregateRelease = async (
+  octokit: ReturnType<typeof github.getOctokit>,
+  {
+    cwd,
+    tagName,
+    releasedPackages,
+    packageGroup,
+  }: {
+    cwd: string;
+    tagName: string;
+    releasedPackages: Package[];
+    packageGroup: string[];
+  }
+) => {
+  let releasedPackagesByName = new Map(
+    releasedPackages.map((x) => [x.packageJson.name, x])
+  );
+  const orderedPackages = await getOrderedPackages(cwd, packageGroup);
+
+  const changelogEntries = await Promise.all(
+    orderedPackages
+      .filter((pkg) => releasedPackagesByName.has(pkg.packageJson.name))
+      .map(async (pkg) => {
+        let changelogFileName = path.join(pkg.dir, "CHANGELOG.md");
+
+        let changelog = await fs.readFile(changelogFileName, "utf8");
+
+        let changelogEntry = getChangelogEntry(
+          changelog,
+          pkg.packageJson.version
+        );
+        if (!changelogEntry) {
+          // we can find a changelog but not the entry for this version
+          // if this is true, something has probably gone wrong
+          throw new Error(
+            `Could not find changelog entry for ${pkg.packageJson.name}@${pkg.packageJson.version}`
+          );
+        }
+
+        return {
+          ...changelogEntry,
+          content:
+            `## ${pkg.packageJson.name}@${pkg.packageJson.version}\n\n` +
+            changelogEntry.content,
+        };
+      })
+  );
+
+  await octokit.repos.createRelease({
+    name: tagName,
+    tag_name: tagName,
+    body: changelogEntries.map((x) => x.content).join("\n "),
+    prerelease: tagName.includes("-"),
+    ...github.context.repo,
+  });
+};
+
+const createPackageRelease = async (
   octokit: ReturnType<typeof github.getOctokit>,
   { pkg, tagName }: { pkg: Package; tagName: string }
 ) => {
@@ -79,7 +139,8 @@ export async function runPublish({
     { cwd }
   );
 
-  await gitUtils.pushTags();
+  // skip pushing per-package tags
+  // await gitUtils.pushTags();
 
   let { packages, tool } = await getPackages(cwd);
   let releasedPackages: Package[] = [];
@@ -104,14 +165,29 @@ export async function runPublish({
       releasedPackages.push(pkg);
     }
 
-    await Promise.all(
-      releasedPackages.map((pkg) =>
-        createRelease(octokit, {
-          pkg,
-          tagName: `${pkg.packageJson.name}@${pkg.packageJson.version}`,
-        })
-      )
-    );
+    // all released packages should have the same version
+    const { version } = releasedPackages[0].packageJson;
+
+    const tagName = `v${version}`;
+
+    await exec("git", ["tag", tagName, "-m", tagName]);
+    await exec("git", ["push", "origin", tagName]);
+
+    await createAggregateRelease(octokit, {
+      cwd,
+      tagName,
+      releasedPackages,
+      packageGroup: contentLayerPackageGroup,
+    });
+
+    // await Promise.all(
+    //   releasedPackages.map((pkg) =>
+    //     createRelease(octokit, {
+    //       pkg,
+    //       tagName: `${pkg.packageJson.name}@${pkg.packageJson.version}`,
+    //     })
+    //   )
+    // );
   } else {
     if (packages.length === 0) {
       throw new Error(
@@ -127,7 +203,7 @@ export async function runPublish({
 
       if (match) {
         releasedPackages.push(pkg);
-        await createRelease(octokit, {
+        await createPackageRelease(octokit, {
           pkg,
           tagName: `v${pkg.packageJson.version}`,
         });
@@ -208,6 +284,7 @@ export async function runVersion({
     q: searchQuery,
   });
   let changedPackages = await getChangedPackages(cwd, versionsByDirectory);
+  let orderedPackages = await getOrderedPackages(cwd, contentLayerPackageGroup);
 
   let prBodyPromise = (async () => {
     return (
@@ -242,6 +319,7 @@ ${
               pkg.packageJson.version
             );
             return {
+              name: pkg.packageJson.name,
               highestLevel: entry.highestLevel,
               private: !!pkg.packageJson.private,
               content:
@@ -252,7 +330,7 @@ ${
         )
       )
         .filter((x) => x)
-        .sort(sortTheThings)
+        .sort((a, b) => sortTheThings(a, b, orderedPackages))
         .map((x) => x.content)
         .join("\n ")
     );

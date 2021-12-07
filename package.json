@@ -32,6 +32,7 @@
     "@manypkg/get-packages": "^1.1.1",
     "@types/fs-extra": "^8.0.0",
     "@types/jest": "^24.0.18",
+    "@types/micromatch": "^4.0.1",
     "@types/node": "^12.7.1",
     "@types/semver": "^6.0.2",
     "babel-jest": "^24.9.0",
@@ -39,6 +40,7 @@
     "husky": "^3.0.3",
     "jest": "^24.9.0",
     "mdast-util-to-string": "^1.0.6",
+    "micromatch": "^4.0.2",
     "remark-parse": "^7.0.1",
     "remark-stringify": "^7.0.3",
     "resolve-from": "^5.0.0",
@@ -46,7 +48,9 @@
     "unified": "^8.3.2"
   },
   "husky": {
-    "hooks": {}
+    "hooks": {
+      "pre-commit": "yarn build && git add dist/index.js"
+    }
   },
   "prettier": {}
 }

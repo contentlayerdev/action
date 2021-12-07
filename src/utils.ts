@@ -3,6 +3,7 @@ import remarkParse from "remark-parse";
 import remarkStringify from "remark-stringify";
 // @ts-ignore
 import mdastToString from "mdast-util-to-string";
+import micromatch from "micromatch";
 import { exec } from "@actions/exec";
 import { getPackages, Package } from "@manypkg/get-packages";
 
@@ -33,6 +34,28 @@ export async function getChangedPackages(
   }
 
   return [...changedPackages];
+}
+
+export async function getOrderedPackages(cwd: string, packageGroup: string[]) {
+  let { packages } = await getPackages(cwd);
+  let packagesByName = new Map(packages.map((x) => [x.packageJson.name, x]));
+  let packageNames = packages.map((pkg) => pkg.packageJson.name);
+
+  const seen = new Set<string>();
+  const ordered: Package[] = [];
+
+  for (let pattern of packageGroup) {
+    const matched = micromatch(packageNames, pattern);
+
+    ordered.push(
+      ...matched
+        .filter((match) => !seen.has(match))
+        .map((pkgName) => packagesByName.get(pkgName)!)
+    );
+    matched.forEach((match) => seen.add(match));
+  }
+
+  return ordered;
 }
 
 export function getChangelogEntry(changelog: string, version: string) {
@@ -114,9 +137,26 @@ export async function execWithOutput(
 }
 
 export function sortTheThings(
-  a: { private: boolean; highestLevel: number },
-  b: { private: boolean; highestLevel: number }
+  a: { name: string; private: boolean; highestLevel: number },
+  b: { name: string; private: boolean; highestLevel: number },
+  orderedPackages: Package[]
 ) {
+  const aIndex = orderedPackages.findIndex(
+    (pkg) => pkg.packageJson.name === a.name
+  );
+  const bIndex = orderedPackages.findIndex(
+    (pkg) => pkg.packageJson.name === b.name
+  );
+
+  if (aIndex !== -1 && bIndex !== -1) {
+    return aIndex - bIndex > 0 ? 1 : -1;
+  }
+  if (aIndex !== -1) {
+    return -1;
+  }
+  if (bIndex !== -1) {
+    return 1;
+  }
   if (a.private === b.private) {
     return b.highestLevel - a.highestLevel;
   }
