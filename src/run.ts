@@ -4,16 +4,32 @@ import fs from "fs-extra";
 import { getPackages, Package } from "@manypkg/get-packages";
 import path from "path";
 import * as semver from "semver";
-import {
-  getChangelogEntry,
-  execWithOutput,
-  getChangedPackages,
-  sortTheThings,
-  getVersionsByDirectory,
-} from "./utils";
+import { getChangelogEntry, execWithOutput } from "./utils";
 import * as gitUtils from "./gitUtils";
 import readChangesetState from "./readChangesetState";
 import resolveFrom from "resolve-from";
+import crypto from "crypto";
+
+const md5 = (str: string) => crypto.createHash("md5").update(str).digest("hex");
+
+async function getLatestChangelogEntry(filePath: string) {
+  const changelog = await fs.readFile(filePath, "utf8");
+  const versionHeader = /^## \d+\.\d+\.\d+/gm;
+
+  // we leverage statefulness of `g` regex here for the second `exec` to start of the `lastIndex` from the first match
+  const start = versionHeader.exec(changelog)!.index;
+  // can't use optional chaining for now because GitHub Actions run on node12, see https://github.com/actions/github-script/pull/182#issuecomment-903966153
+  const endExecResult = versionHeader.exec(changelog);
+  const end = endExecResult ? endExecResult.index : changelog.length;
+
+  const latestChangelogEntry = changelog.slice(start, end);
+  const [match, version] = latestChangelogEntry.match(/## (.+)\s*$/m)!;
+
+  return {
+    version,
+    content: latestChangelogEntry.slice(match.length).trim(),
+  };
+}
 
 const createRelease = async (
   octokit: ReturnType<typeof github.getOctokit>,
@@ -188,8 +204,6 @@ export async function runVersion({
   await gitUtils.switchToMaybeExistingBranch(versionBranch);
   await gitUtils.reset(github.context.sha);
 
-  let versionsByDirectory = await getVersionsByDirectory(cwd);
-
   if (script) {
     let [versionCommand, ...versionArgs] = script.split(/\s+/);
     await exec(versionCommand, versionArgs, { cwd });
@@ -207,7 +221,10 @@ export async function runVersion({
   let searchResultPromise = octokit.search.issuesAndPullRequests({
     q: searchQuery,
   });
-  let changedPackages = await getChangedPackages(cwd, versionsByDirectory);
+
+  const latestChangelogEntry = await getLatestChangelogEntry(
+    path.join(cwd, "CHANGELOG.md")
+  );
 
   let prBodyPromise = (async () => {
     return (
@@ -228,33 +245,7 @@ ${
     : ""
 }
 # Releases
-` +
-      (
-        await Promise.all(
-          changedPackages.map(async (pkg) => {
-            let changelogContents = await fs.readFile(
-              path.join(pkg.dir, "CHANGELOG.md"),
-              "utf8"
-            );
-
-            let entry = getChangelogEntry(
-              changelogContents,
-              pkg.packageJson.version
-            );
-            return {
-              highestLevel: entry.highestLevel,
-              private: !!pkg.packageJson.private,
-              content:
-                `## ${pkg.packageJson.name}@${pkg.packageJson.version}\n\n` +
-                entry.content,
-            };
-          })
-        )
-      )
-        .filter((x) => x)
-        .sort(sortTheThings)
-        .map((x) => x.content)
-        .join("\n ")
+` + latestChangelogEntry
     );
   })();
 
@@ -262,6 +253,9 @@ ${
 
   // project with `commit: true` setting could have already committed files
   if (!(await gitUtils.checkIfClean())) {
+    // remove the Contentlayer CHANGELOG since we don't want to keep it in git
+    await fs.unlink(path.join(cwd, "CHANGELOG.md"));
+
     const finalCommitMessage = `${commitMessage}${
       !!preState ? ` (${preState.tag})` : ""
     }`;
@@ -273,7 +267,21 @@ ${
   let searchResult = await searchResultPromise;
   console.log(JSON.stringify(searchResult.data, null, 2));
   if (searchResult.data.items.length === 0) {
+    const { data: draftRelease } = await octokit.repos.createRelease({
+      ...github.context.repo,
+      draft: true,
+      name: `v${latestChangelogEntry.version}`,
+      // note that this won't create this tag immediately since we are creating a draft
+      tag_name: `v${latestChangelogEntry.version}`,
+      body: latestChangelogEntry.content,
+    });
     console.log("creating pull request");
+    prBodyPromise = prBodyPromise.then(
+      (body) =>
+        `---\ndraft_id: ${draftRelease.id}\nchecksum: ${md5(
+          draftRelease.body
+        )}\n---\n\n${body}`
+    );
     await octokit.pulls.create({
       base: branch,
       head: versionBranch,
@@ -282,12 +290,54 @@ ${
       ...github.context.repo,
     });
   } else {
-    octokit.pulls.update({
-      pull_number: searchResult.data.items[0].number,
+    const pull = searchResult.data.items[0];
+    console.log("pull request found");
+
+    const frontmatterMatch = pull.body.match(/\s*---([^]*?)\n\s*---\s*\n/);
+
+    if (frontmatterMatch) {
+      const [, frontmatter] = frontmatterMatch;
+      let draftId: string;
+      let checksum: string;
+      for (const line of frontmatter.split("\n")) {
+        const draftIdMatch = line.match(/^draft_id:(.+)/);
+        if (draftIdMatch) {
+          draftId = draftIdMatch[1].trim();
+          continue;
+        }
+        const checksumMatch = line.match(/^checksum:(.+)/);
+        if (checksumMatch) {
+          checksum = checksumMatch[1].trim();
+          continue;
+        }
+      }
+      const { data: draftRelease } = await octokit.repos.getRelease({
+        ...github.context.repo,
+        release_id: parseInt(draftId!),
+      });
+      const releaseContentHash = md5(draftRelease.body);
+      if (releaseContentHash === checksum!) {
+        prBodyPromise = prBodyPromise.then(
+          (body) =>
+            `---\ndraft_id: ${draftId}\nchecksum: ${md5(
+              latestChangelogEntry.content
+            )}\n---\n\n${body}`
+        );
+      } else {
+        // preserve whatever there is so the next run of the action can also bail out on the checksum mismatch
+        prBodyPromise = prBodyPromise.then(
+          (body) => `---\n${frontmatter}\n---\n\n${body}`
+        );
+      }
+    } else {
+      console.log("frontmatter not found in the PR body");
+    }
+
+    await octokit.pulls.update({
+      pull_number: pull.number,
       title: finalPrTitle,
       body: await prBodyPromise,
       ...github.context.repo,
     });
-    console.log("pull request found");
   }
 }

@@ -14,7 +14,7 @@ const getOptionalInput = (name: string) => core.getInput(name) || undefined;
     return;
   }
 
-  let setupGitUser = core.getBooleanInput('setupGitUser');
+  let setupGitUser = core.getBooleanInput("setupGitUser");
 
   if (setupGitUser) {
     console.log("setting git user");
