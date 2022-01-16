@@ -188,7 +188,8 @@ export async function runPublish({
             return mergedAtA > mergedAtB ? 1 : mergedAtA < mergedAtB ? -1 : 0;
           })[0] || null;
         if (pull) {
-          const frontmatterData = getPullFrontmatterData(pull.body);
+          console.log(`Found pull ${pull.id} as the latest versioning PR.`);
+          const frontmatterData = getPullFrontmatterData(pull.body || "");
           if (frontmatterData && frontmatterData.draftId) {
             await octokit.repos.updateRelease({
               ...github.context.repo,
@@ -375,7 +376,7 @@ ${
     const pull = searchResult.data.items[0];
     console.log("pull request found");
 
-    const frontmatterData = getPullFrontmatterData(pull.body);
+    const frontmatterData = getPullFrontmatterData(pull.body || "");
 
     if (
       frontmatterData &&
