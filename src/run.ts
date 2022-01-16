@@ -31,6 +31,47 @@ async function getLatestChangelogEntry(filePath: string) {
   };
 }
 
+function getPullFrontmatterData(pullBody: string) {
+  const frontmatterMatch = pullBody.match(/\s*---([^]*?)\n\s*---\s*\n/);
+
+  if (!frontmatterMatch) {
+    return null;
+  }
+
+  const [, frontmatterContent] = frontmatterMatch;
+  let draftId = null;
+  let checksum = null;
+  // TODO: replace with js-yaml
+  for (const line of frontmatterContent.split("\n")) {
+    const draftIdMatch = line.match(/^draft_id:(.+)/);
+    if (draftIdMatch) {
+      draftId = parseInt(draftIdMatch[1].trim());
+      continue;
+    }
+    const checksumMatch = line.match(/^checksum:(.+)/);
+    if (checksumMatch) {
+      checksum = checksumMatch[1].trim();
+      continue;
+    }
+  }
+
+  return {
+    draftId:
+      typeof draftId === "number" && !Number.isNaN(draftId) ? draftId : null,
+    checksum,
+  };
+}
+
+function createPullFrontmatter({
+  draftId,
+  checksum,
+}: {
+  draftId: number;
+  checksum: string;
+}) {
+  return `---\ndraft_id: ${draftId}\nchecksum: ${checksum}\n---`;
+}
+
 const createRelease = async (
   octokit: ReturnType<typeof github.getOctokit>,
   { pkg, tagName }: { pkg: Package; tagName: string }
@@ -120,14 +161,54 @@ export async function runPublish({
       releasedPackages.push(pkg);
     }
 
-    await Promise.all(
-      releasedPackages.map((pkg) =>
-        createRelease(octokit, {
-          pkg,
-          tagName: `${pkg.packageJson.name}@${pkg.packageJson.version}`,
-        })
-      )
-    );
+    if (releasedPackages.length) {
+      const commit = await gitUtils.getLatestChangesetVersionCommit();
+      if (commit) {
+        const {
+          data: pulls,
+        } = await octokit.repos.listPullRequestsAssociatedWithCommit({
+          ...github.context.repo,
+          commit_sha: commit,
+        });
+        const pull =
+          pulls.sort((a, b) => {
+            // sorting algorithm taken from:
+            // https://github.com/changesets/changesets/blob/ce637e57ea12cdfbd62ccde1735e1ae2e5f72364/packages/get-github-info/src/index.ts#L179-L192
+            if (a.merged_at === null && b.merged_at === null) {
+              return 0;
+            }
+            if (a.merged_at === null) {
+              return 1;
+            }
+            if (b.merged_at === null) {
+              return -1;
+            }
+            const mergedAtA = new Date(a.merged_at);
+            const mergedAtB = new Date(b.merged_at);
+            return mergedAtA > mergedAtB ? 1 : mergedAtA < mergedAtB ? -1 : 0;
+          })[0] || null;
+        if (pull) {
+          const frontmatterData = getPullFrontmatterData(pull.body);
+          if (frontmatterData && frontmatterData.draftId) {
+            await octokit.repos.updateRelease({
+              ...github.context.repo,
+              release_id: frontmatterData.draftId,
+
+              // "promote" this release to a published one
+              draft: false,
+            });
+          } else {
+            console.log(
+              `The PR associated with ${commit} commit doesn't have draft_id.`
+            );
+          }
+        } else {
+          console.log(
+            `Couldn't find a pull request associated with the ${commit} commit.`
+          );
+        }
+      }
+    }
   } else {
     if (packages.length === 0) {
       throw new Error(
@@ -278,9 +359,10 @@ ${
     console.log("creating pull request");
     prBodyPromise = prBodyPromise.then(
       (body) =>
-        `---\ndraft_id: ${draftRelease.id}\nchecksum: ${md5(
-          draftRelease.body
-        )}\n---\n\n${body}`
+        `${createPullFrontmatter({
+          draftId: draftRelease.id,
+          checksum: md5(draftRelease.body),
+        })}\n\n${body}`
     );
     await octokit.pulls.create({
       base: branch,
@@ -293,44 +375,46 @@ ${
     const pull = searchResult.data.items[0];
     console.log("pull request found");
 
-    const frontmatterMatch = pull.body.match(/\s*---([^]*?)\n\s*---\s*\n/);
+    const frontmatterData = getPullFrontmatterData(pull.body);
 
-    if (frontmatterMatch) {
-      const [, frontmatter] = frontmatterMatch;
-      let draftId: string;
-      let checksum: string;
-      for (const line of frontmatter.split("\n")) {
-        const draftIdMatch = line.match(/^draft_id:(.+)/);
-        if (draftIdMatch) {
-          draftId = draftIdMatch[1].trim();
-          continue;
-        }
-        const checksumMatch = line.match(/^checksum:(.+)/);
-        if (checksumMatch) {
-          checksum = checksumMatch[1].trim();
-          continue;
-        }
-      }
+    if (
+      frontmatterData &&
+      frontmatterData.draftId &&
+      frontmatterData.checksum
+    ) {
+      const { draftId, checksum } = frontmatterData;
       const { data: draftRelease } = await octokit.repos.getRelease({
         ...github.context.repo,
-        release_id: parseInt(draftId!),
+        release_id: draftId,
       });
       const releaseContentHash = md5(draftRelease.body);
-      if (releaseContentHash === checksum!) {
+      if (releaseContentHash === checksum) {
+        const { data: updatedRelease } = await octokit.repos.updateRelease({
+          ...github.context.repo,
+          release_id: draftId,
+
+          draft: true,
+          name: `v${latestChangelogEntry.version}`,
+          // note that this won't create this tag immediately since we are updating a draft
+          tag_name: `v${latestChangelogEntry.version}`,
+          body: latestChangelogEntry.content,
+        });
         prBodyPromise = prBodyPromise.then(
           (body) =>
-            `---\ndraft_id: ${draftId}\nchecksum: ${md5(
-              latestChangelogEntry.content
-            )}\n---\n\n${body}`
+            `${createPullFrontmatter({
+              draftId,
+              checksum: md5(updatedRelease.body),
+            })}\n\n${body}`
         );
       } else {
         // preserve whatever there is so the next run of the action can also bail out on the checksum mismatch
         prBodyPromise = prBodyPromise.then(
-          (body) => `---\n${frontmatter}\n---\n\n${body}`
+          (body) => `${createPullFrontmatter({ draftId, checksum })}\n\n${body}`
         );
       }
     } else {
-      console.log("frontmatter not found in the PR body");
+      // we could try preserve the existing frontmatter but if it's missing we can also just ignore it and it shouldn't do much hurm
+      console.log("frontmatter not found (or incomplete) in the PR body");
     }
 
     await octokit.pulls.update({
