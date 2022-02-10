@@ -32,7 +32,7 @@ async function getLatestChangelogEntry(filePath: string) {
 }
 
 function getPullFrontmatterData(pullBody: string) {
-  const frontmatterMatch = pullBody.match(/\s*---([^]*?)\n\s*---\s*\n/);
+  const frontmatterMatch = pullBody.match(/\s*<!--([^]*?)\n\s*-->\s*\n/);
 
   if (!frontmatterMatch) {
     return null;
@@ -69,7 +69,7 @@ function createPullFrontmatter({
   draftId: number;
   checksum: string;
 }) {
-  return `---\ndraft_id: ${draftId}\nchecksum: ${checksum}\n---`;
+  return `<!--\ndraft_id: ${draftId}\nchecksum: ${checksum}\n-->`;
 }
 
 const createRelease = async (
